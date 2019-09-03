@@ -3,7 +3,7 @@ import {Cache, Configuration, Descriptor, LightReport, MessageName} from '@yarnp
 import {Project, StreamReport, Workspace}                           from '@yarnpkg/core';
 import {structUtils}                                                from '@yarnpkg/core';
 import {PortablePath}                                               from '@yarnpkg/fslib';
-import {Command}                                                    from 'clipanion';
+import {Command, UsageError}                                        from 'clipanion';
 import inquirer                                                     from 'inquirer';
 
 import * as suggestUtils                                            from '../suggestUtils';
@@ -25,6 +25,9 @@ export default class AddCommand extends BaseCommand {
 
   @Command.Boolean(`-D,--dev`)
   dev: boolean = false;
+
+  @Command.Boolean(`--prefer-dev`)
+  preferDev: boolean = false;
 
   @Command.Boolean(`-P,--peer`)
   peer: boolean = false;
@@ -78,9 +81,9 @@ export default class AddCommand extends BaseCommand {
       output: this.context.stdout,
     });
 
-    const target = this.peer
+    const givenTarget = this.peer
       ? suggestUtils.Target.PEER
-      : this.dev
+      : this.dev || this.preferDev
         ? suggestUtils.Target.DEVELOPMENT
         : suggestUtils.Target.REGULAR;
 
@@ -110,9 +113,25 @@ export default class AddCommand extends BaseCommand {
         ? await suggestUtils.extractDescriptorFromPath(pseudoDescriptor as PortablePath, {cache, cwd: this.context.cwd, workspace})
         : structUtils.parseDescriptor(pseudoDescriptor);
 
+      const inRegular = workspace.manifest[suggestUtils.Target.REGULAR].get(request.identHash);
+      const inDev = workspace.manifest[suggestUtils.Target.DEVELOPMENT].get(request.identHash);
+      const inPeer = workspace.manifest[suggestUtils.Target.PEER].get(request.identHash);
+
+      if (typeof inRegular !== `undefined` && (this.dev || this.peer))
+        throw new UsageError(`Package "${inRegular.name}" is already a regular dependency`);
+
+      if (typeof inPeer !== `undefined` && givenTarget === suggestUtils.Target.REGULAR)
+        throw new UsageError(`Package "${inPeer.name}" is already a peer dependency`);
+
+      const target = inRegular
+        ? suggestUtils.Target.REGULAR
+        : inDev
+          ? suggestUtils.Target.DEVELOPMENT
+          : givenTarget;
+
       const suggestions = await suggestUtils.getSuggestedDescriptors(request, {project, workspace, cache, target, modifier, strategies, maxResults});
 
-      return [request, suggestions] as [Descriptor, Array<suggestUtils.Suggestion>];
+      return [request, suggestions, target] as [Descriptor, Array<suggestUtils.Suggestion>, suggestUtils.Target];
     }));
 
     const checkReport = await LightReport.start({
@@ -153,7 +172,13 @@ export default class AddCommand extends BaseCommand {
       Descriptor
     ]> = [];
 
-    for (const [/*request*/, suggestions] of allSuggestions) {
+    const afterWorkspaceDependencyRemovalList: Array<[
+      Workspace,
+      suggestUtils.Target,
+      Descriptor
+    ]> = [];
+
+    for (const [/*request*/, suggestions, target] of allSuggestions) {
       let selected;
 
       const nonNullSuggestions = suggestions.filter(suggestion => {
@@ -202,6 +227,23 @@ export default class AddCommand extends BaseCommand {
           ]);
         }
       }
+
+      for (const key in suggestUtils.Target) {
+        const otherTarget = suggestUtils.Target[key as keyof typeof suggestUtils.Target];
+
+        if (otherTarget === target) continue;
+
+        const dup = workspace.manifest[otherTarget].get(selected.identHash);
+
+        if (typeof dup !== `undefined`) {
+          workspace.manifest[otherTarget].delete(dup.identHash);
+          afterWorkspaceDependencyRemovalList.push([
+            workspace,
+            otherTarget,
+            dup,
+          ]);
+        }
+      }
     }
 
     await configuration.triggerMultipleHooks(
@@ -212,6 +254,11 @@ export default class AddCommand extends BaseCommand {
     await configuration.triggerMultipleHooks(
       (hooks: Hooks) => hooks.afterWorkspaceDependencyReplacement,
       afterWorkspaceDependencyReplacementList,
+    );
+
+    await configuration.triggerMultipleHooks(
+      (hooks: Hooks) => hooks.afterWorkspaceDependencyRemoval,
+      afterWorkspaceDependencyRemovalList,
     );
 
     if (askedQuestions)
